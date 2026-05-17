@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-*
+.env
+.venv/
+venv/
+paper_reader_data/
+page_images/
+figures/
+*.log
