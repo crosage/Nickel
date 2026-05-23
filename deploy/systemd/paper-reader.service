@@ -1,0 +1,16 @@
+[Unit]
+Description=Nickel Paper Reader FastAPI Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=server118
+WorkingDirectory=/data/D/zzn/evo/back/Nickel
+EnvironmentFile=/etc/nickel/nickel.env
+ExecStart=/home/server118/anaconda3/envs/research_kb/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+tunnel: pixiv-helper
+credentials-file: /etc/cloudflared/<tunnel-id>.json
+
+ingress:
+  - hostname: api.zundamon.bond
+    service: http://127.0.0.1:23333
+  - hostname: paper-api.zundamon.bond
+    service: http://127.0.0.1:8000
+  - service: http_status:404
