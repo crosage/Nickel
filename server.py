@@ -230,6 +230,13 @@ def mark_stale_llm_jobs_failed() -> None:
                 finished_at=datetime('now')
             WHERE status IN ('queued', 'running')
         """)
+        db.execute("""
+            UPDATE translation_chunks
+            SET status='failed',
+                error='server restarted before this chunk finished',
+                updated_at=datetime('now')
+            WHERE status='running'
+        """)
 
 
 def set_llm_job(paper_id: str, job_type: str, status: str, *, force: bool = False, error: str = "") -> None:
@@ -919,6 +926,23 @@ def _call_llm(messages: list[dict], max_tokens: int, temperature: float = 0.3) -
     return resp.json()
 
 
+def _extract_llm_content(data: dict, context: str) -> tuple[str, int]:
+    if "error" in data:
+        raise RuntimeError(str(data["error"]))
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        preview = json.dumps(data, ensure_ascii=False)[:500]
+        raise RuntimeError(f"[LLM returned no choices for {context}: {preview}]")
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message") if isinstance(first.get("message"), dict) else {}
+    content = (message.get("content") or "").strip()
+    if not content:
+        finish_reason = first.get("finish_reason", "")
+        preview = json.dumps(data, ensure_ascii=False)[:500]
+        raise RuntimeError(f"[LLM returned empty content for {context}; finish_reason={finish_reason}: {preview}]")
+    return content, data.get("usage", {}).get("total_tokens", 0)
+
+
 def split_translation_text(text: str, max_chars: int = TRANSLATION_CHUNK_MAX_CHARS) -> list[str]:
     """Split long paper text at paragraph boundaries to avoid LLM truncation."""
     text = text.strip()
@@ -963,10 +987,7 @@ def translate_single_chunk(title: str, authors: str, chunk: str, idx: int, total
         {"role": "system", "content": TRANSLATION_CHUNK_PROMPT},
         {"role": "user", "content": header},
     ], max_tokens=10000, temperature=0.1)
-    if "error" in data:
-        raise RuntimeError(data["error"])
-    translated = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    return translated, data.get("usage", {}).get("total_tokens", 0)
+    return _extract_llm_content(data, f"translation chunk {idx}/{total}")
 
 
 def translate_text_chunks(title: str, authors: str, text: str) -> tuple[str, int]:
@@ -1092,11 +1113,7 @@ def analyze_paper(paper_id: str) -> str:
             {"role": "system", "content": ANALYSIS_PROMPT},
             {"role": "user", "content": "Please analyze:\n\n<paper>\n" + text + "\n</paper>"},
         ], max_tokens=10240, temperature=0.3)
-        if "error" in data:
-            return data["error"]
-        analysis = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-        tokens = data.get("usage", {}).get("total_tokens", 0)
+        analysis, tokens = _extract_llm_content(data, "analysis")
         with get_db() as db:
             db.execute("""
                 INSERT INTO analyses (paper_id, analysis, model, token_count, created_at)
