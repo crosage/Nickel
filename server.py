@@ -448,7 +448,7 @@ SECTION_PATTERNS = {
     "introduction": [re.compile(r"^(?:\d+\.?\s*)?(?:Introduction|INTRODUCTION)\s*$", re.MULTILINE)],
     "method": [re.compile(
         r"^(?:\d+\.?\s*)?(?:Method(?:ology|s)?|Approach|Proposed\s+(?:Method|Approach|Framework)|"
-        r"Our\s+(?:Method|Approach)|Framework|Model|METHODS?)\s*$",
+        r"Our\s+(?:Method|Approach)|Framework|Model|METHODS?|[A-Z][A-Za-z0-9-]*\s+Framework)\s*$",
         re.MULTILINE | re.IGNORECASE)],
     "experiments": [re.compile(
         r"^(?:\d+\.?\s*)?(?:Experiments?|Results?|Experimental|Evaluation|EXPERIMENTS?)\s*$",
@@ -459,10 +459,11 @@ SECTION_PATTERNS = {
 }
 
 NEXT_SECTION_RE = re.compile(
-    r"^(?:\d+\.?\s+)?(?:Introduction|Related|Background|Preliminaries|"
-    r"Method|Approach|Proposed|Our\s+|Framework|"
-    r"Experiment|Results|Evaluation|Ablation|"
-    r"Conclusion|Summary|Discussion|Acknowledg|References|REFERENCES|Appendix)\b",
+    r"^(?:\d+(?:\.\d+)*\.?\s+)?(?:Introduction|Related\s+Work|Background|Preliminaries|"
+    r"Method(?:ology|s)?|Approach|Proposed\s+(?:Method|Approach|Framework)|Our\s+(?:Method|Approach)|"
+    r"[A-Z][A-Za-z0-9-]*\s+Framework|Framework|Model|"
+    r"Experiments?|Results?|Experimental|Evaluation|Ablation|"
+    r"Conclusion|Conclusions|Summary|Discussion|Acknowledg(?:e)?ments?|References|Appendix)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
 
