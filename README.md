@@ -37,6 +37,18 @@ sudo systemctl enable --now paper-reader.service
 
 Edit `/etc/nickel/nickel.env` with the real LLM key before starting the service.
 
+For semantic Figure extraction, build PDFFigures2 and point the service at the jar:
+
+```bash
+git clone https://github.com/allenai/pdffigures2.git /data/D/zzn/tools/pdffigures2
+cd /data/D/zzn/tools/pdffigures2
+sbt assembly
+echo "PDFFIGURES2_JAR=/data/D/zzn/tools/pdffigures2/pdffigures2.jar" | sudo tee -a /etc/nickel/nickel.env
+sudo systemctl restart paper-reader.service
+```
+
+If `PDFFIGURES2_JAR` or `pdffigures2` is unavailable, `/api/papers/{id}/figures` falls back to PDF page snapshots and reports `extraction_mode=page_snapshot`.
+
 Cloudflare Tunnel exposes the backend through the existing `pixiv-helper` tunnel:
 
 ```bash

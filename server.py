@@ -552,29 +552,42 @@ def _pdffigures2_command(pdf_path: Path, out_dir: Path, prefix: str) -> list[str
     if PDFFIGURES2_CMD:
         return [
             *PDFFIGURES2_CMD.split(),
-            "-m", str(out_dir / f"{prefix}.json"),
-            "-d", str(out_dir),
-            "-f", prefix,
             str(pdf_path),
+            "-m", str(out_dir / f"{prefix}-"),
+            "-d", str(out_dir / f"data-"),
+            "-f", "png",
+            "-e",
+            "-q",
         ]
     if PDFFIGURES2_JAR:
         return [
-            "java", "-jar", PDFFIGURES2_JAR,
-            "-m", str(out_dir / f"{prefix}.json"),
-            "-d", str(out_dir),
-            "-f", prefix,
+            "java",
+            "-Dsun.java2d.cmm=sun.java2d.cmm.kcms.KcmsServiceProvider",
+            "-cp", PDFFIGURES2_JAR,
+            "org.allenai.pdffigures2.FigureExtractorBatchCli",
             str(pdf_path),
+            "-m", str(out_dir / f"{prefix}-"),
+            "-d", str(out_dir / f"data-"),
+            "-f", "png",
+            "-e",
+            "-q",
         ]
     executable = shutil.which("pdffigures2") or shutil.which("pdffigures")
     if executable:
         return [
             executable,
-            "-m", str(out_dir / f"{prefix}.json"),
-            "-d", str(out_dir),
-            "-f", prefix,
             str(pdf_path),
+            "-m", str(out_dir / f"{prefix}-"),
+            "-d", str(out_dir / f"data-"),
+            "-f", "png",
+            "-e",
+            "-q",
         ]
     return []
+
+
+def pdffigures2_available() -> bool:
+    return bool(_pdffigures2_command(Path("probe.pdf"), Path("."), "probe"))
 
 
 def _load_pdffigures2_figures(paper_id: str, pdf_path: Path, out_dir: Path, max_figures: int) -> list[dict]:
@@ -589,7 +602,7 @@ def _load_pdffigures2_figures(paper_id: str, pdf_path: Path, out_dir: Path, max_
         log.warning(f"pdffigures2 extraction failed for {paper_id}: {e}")
         return []
 
-    meta_path = out_dir / f"{paper_id}.json"
+    meta_path = out_dir / f"data-{pdf_path.stem}.json"
     if not meta_path.exists():
         return []
 
@@ -603,10 +616,12 @@ def _load_pdffigures2_figures(paper_id: str, pdf_path: Path, out_dir: Path, max_
     for idx, item in enumerate(raw_items, 1):
         if str(item.get("figType", "Figure")).lower() == "table":
             continue
-        render_url = item.get("renderURL") or item.get("imageText")
-        image_path = out_dir / render_url if render_url else None
+        render_url = item.get("renderURL")
+        image_path = Path(render_url) if render_url else None
+        if image_path and not image_path.is_absolute():
+            image_path = out_dir / image_path
         if not image_path or not image_path.exists():
-            candidates = sorted(out_dir.glob(f"{paper_id}*Figure*{idx}*")) + sorted(out_dir.glob(f"{paper_id}*.png"))
+            candidates = sorted(out_dir.glob(f"{paper_id}-Figure*")) + sorted(out_dir.glob(f"{paper_id}*.png"))
             image_path = candidates[0] if candidates else None
         if not image_path or not image_path.exists():
             continue
@@ -653,7 +668,8 @@ def extract_pdf_figures(paper_id: str, max_figures: int = MAX_EXTRACTED_FIGURES,
     if meta_path.exists() and not refresh:
         try:
             cached = json.loads(meta_path.read_text(encoding="utf-8"))
-            if _figure_cache_is_current(cached):
+            has_only_snapshots = cached and all(fig.get("source") == "page_snapshot" for fig in cached)
+            if _figure_cache_is_current(cached) and not (pdffigures2_available() and has_only_snapshots):
                 return cached[:max_figures]
         except Exception:
             pass
@@ -1885,6 +1901,8 @@ def get_figures(paper_id: str, limit: int = MAX_EXTRACTED_FIGURES):
     """Extract figures with pdffigures2 when configured, otherwise return page snapshots."""
     limit = max(1, min(limit, 40))
     figures = extract_pdf_figures(paper_id, max_figures=limit)
+    sources = sorted({str(fig.get("source", "unknown")) for fig in figures})
+    extraction_mode = "pdffigures2" if any(src == "pdffigures2" for src in sources) else "page_snapshot"
     with get_db() as db:
         refs = {
             row["figure_no"]: dict(row)
@@ -1901,7 +1919,18 @@ def get_figures(paper_id: str, limit: int = MAX_EXTRACTED_FIGURES):
                 "confidence": ref.get("confidence", 0.0),
             })
         enriched.append(item)
-    return {"paper_id": paper_id, "figures": enriched}
+    return {
+        "paper_id": paper_id,
+        "figures": enriched,
+        "extraction_mode": extraction_mode,
+        "sources": sources,
+        "pdffigures2_available": pdffigures2_available(),
+        "note": (
+            "pdffigures2 extracted semantic figure crops."
+            if extraction_mode == "pdffigures2"
+            else "pdffigures2 is not configured or found no figures; returning PDF page snapshots."
+        ),
+    }
 
 
 @app.get("/api/papers/{paper_id}/figures/{figure_no}")
