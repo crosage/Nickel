@@ -168,6 +168,19 @@ def init_db():
         PRIMARY KEY (paper_id, figure_no)
     );
 
+    CREATE TABLE IF NOT EXISTS llm_jobs (
+        paper_id TEXT NOT NULL REFERENCES papers(id),
+        job_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        force INTEGER DEFAULT 0,
+        error TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        started_at TEXT DEFAULT NULL,
+        finished_at TEXT DEFAULT NULL,
+        PRIMARY KEY (paper_id, job_type)
+    );
+
     CREATE TABLE IF NOT EXISTS sync_log (
         conference TEXT PRIMARY KEY,
         last_sync TEXT DEFAULT (datetime('now')),
@@ -180,6 +193,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_notes_paper ON notes(paper_id);
     CREATE INDEX IF NOT EXISTS idx_translation_chunks_paper ON translation_chunks(paper_id, status);
     CREATE INDEX IF NOT EXISTS idx_figure_refs_paper ON figure_refs(paper_id);
+    CREATE INDEX IF NOT EXISTS idx_llm_jobs_type_status ON llm_jobs(job_type, status, updated_at);
     """)
     for ddl in [
         "ALTER TABLE analyses ADD COLUMN translation TEXT DEFAULT ''",
@@ -204,6 +218,66 @@ def get_db():
         conn.commit()
     finally:
         conn.close()
+
+
+def mark_stale_llm_jobs_failed() -> None:
+    with get_db() as db:
+        db.execute("""
+            UPDATE llm_jobs
+            SET status='failed',
+                error='server restarted before this job finished',
+                updated_at=datetime('now'),
+                finished_at=datetime('now')
+            WHERE status IN ('queued', 'running')
+        """)
+
+
+def set_llm_job(paper_id: str, job_type: str, status: str, *, force: bool = False, error: str = "") -> None:
+    started_expr = "datetime('now')" if status == "running" else "started_at"
+    finished_expr = "datetime('now')" if status in ("done", "failed", "cached", "missing") else "NULL"
+    with get_db() as db:
+        db.execute(f"""
+            INSERT INTO llm_jobs (
+                paper_id, job_type, status, force, error,
+                created_at, updated_at, started_at, finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'),
+                    CASE WHEN ?='running' THEN datetime('now') ELSE NULL END,
+                    CASE WHEN ? IN ('done', 'failed', 'cached', 'missing') THEN datetime('now') ELSE NULL END)
+            ON CONFLICT(paper_id, job_type) DO UPDATE SET
+                status=excluded.status,
+                force=excluded.force,
+                error=excluded.error,
+                updated_at=datetime('now'),
+                started_at={started_expr},
+                finished_at={finished_expr}
+        """, (paper_id, job_type, status, 1 if force else 0, error, status, status))
+
+
+def get_llm_job_status(paper_id: str, job_type: str) -> str:
+    with get_db() as db:
+        row = db.execute("""
+            SELECT status FROM llm_jobs
+            WHERE paper_id=? AND job_type=?
+        """, (paper_id, job_type)).fetchone()
+    return row["status"] if row else ""
+
+
+def get_recent_llm_jobs(job_type: str, limit: int = 20) -> list[dict]:
+    with get_db() as db:
+        rows = db.execute("""
+            SELECT j.paper_id, j.job_type, j.status, j.error, j.force,
+                   j.created_at, j.updated_at, j.started_at, j.finished_at,
+                   p.title, p.conference
+            FROM llm_jobs j
+            LEFT JOIN papers p ON p.id = j.paper_id
+            WHERE j.job_type=?
+            ORDER BY
+                CASE j.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,
+                j.updated_at DESC
+            LIMIT ?
+        """, (job_type, limit)).fetchall()
+    return [dict(row) for row in rows]
 
 
 # ─────────────────────────────────────────────
@@ -1043,22 +1117,28 @@ def analyze_paper(paper_id: str) -> str:
 def _analysis_job_status(paper_id: str) -> str:
     with ANALYSIS_LOCK:
         future = ANALYSIS_JOBS.get(paper_id)
-        if not future:
-            return ""
+    if future:
         if future.running():
             return "running"
         if not future.done():
             return "queued"
         err = future.exception()
         return "failed" if err else "done"
+    return get_llm_job_status(paper_id, "analysis")
 
 
 def _run_analysis_job(paper_id: str) -> None:
     log.info(f"Background analysis started: {paper_id}")
-    analysis = analyze_paper(paper_id)
-    if analysis.startswith("["):
-        raise RuntimeError(analysis)
-    log.info(f"Background analysis finished: {paper_id} | {len(analysis)} chars")
+    set_llm_job(paper_id, "analysis", "running")
+    try:
+        analysis = analyze_paper(paper_id)
+        if analysis.startswith("["):
+            raise RuntimeError(analysis)
+        set_llm_job(paper_id, "analysis", "done")
+        log.info(f"Background analysis finished: {paper_id} | {len(analysis)} chars")
+    except Exception as e:
+        set_llm_job(paper_id, "analysis", "failed", error=str(e))
+        raise
 
 
 def queue_analysis(paper_id: str, force: bool = False) -> dict:
@@ -1071,6 +1151,7 @@ def queue_analysis(paper_id: str, force: bool = False) -> dict:
             raise HTTPException(404, "paper not found")
         row = db.execute("SELECT analysis FROM analyses WHERE paper_id=?", (paper_id,)).fetchone()
         if row and row["analysis"] and not force:
+            set_llm_job(paper_id, "analysis", "cached")
             return {
                 "paper_id": paper_id,
                 "status": "cached",
@@ -1079,6 +1160,7 @@ def queue_analysis(paper_id: str, force: bool = False) -> dict:
                 "analysis": row["analysis"],
             }
         if force:
+            set_llm_job(paper_id, "analysis", "queued", force=True)
             db.execute("""
                 UPDATE analyses
                 SET analysis='', model='', token_count=0, created_at=datetime('now')
@@ -1094,6 +1176,7 @@ def queue_analysis(paper_id: str, force: bool = False) -> dict:
                 "cached": False,
                 "queued": True,
             }
+        set_llm_job(paper_id, "analysis", "queued", force=force)
         future = ANALYSIS_EXECUTOR.submit(_run_analysis_job, paper_id)
         ANALYSIS_JOBS[paper_id] = future
         return {"paper_id": paper_id, "status": "queued", "cached": False, "queued": True}
@@ -1112,6 +1195,7 @@ def delete_analysis(paper_id: str) -> dict:
             SET analysis='', model='', token_count=0, created_at=datetime('now')
             WHERE paper_id=?
         """, (paper_id,))
+    set_llm_job(paper_id, "analysis", "missing")
     return {"paper_id": paper_id, "deleted": True, "status": "missing"}
 
 
@@ -1191,22 +1275,28 @@ def translate_paper(paper_id: str) -> str:
 def _translation_job_status(paper_id: str) -> str:
     with TRANSLATION_LOCK:
         future = TRANSLATION_JOBS.get(paper_id)
-        if not future:
-            return ""
+    if future:
         if future.running():
             return "running"
         if not future.done():
             return "queued"
         err = future.exception()
         return "failed" if err else "done"
+    return get_llm_job_status(paper_id, "translation")
 
 
 def _run_translation_job(paper_id: str) -> None:
     log.info(f"Background translation started: {paper_id}")
-    translation = translate_paper(paper_id)
-    if translation.startswith("["):
-        raise RuntimeError(translation)
-    log.info(f"Background translation finished: {paper_id} | {len(translation)} chars")
+    set_llm_job(paper_id, "translation", "running")
+    try:
+        translation = translate_paper(paper_id)
+        if translation.startswith("["):
+            raise RuntimeError(translation)
+        set_llm_job(paper_id, "translation", "done")
+        log.info(f"Background translation finished: {paper_id} | {len(translation)} chars")
+    except Exception as e:
+        set_llm_job(paper_id, "translation", "failed", error=str(e))
+        raise
 
 
 def queue_translation(paper_id: str, force: bool = False) -> dict:
@@ -1219,6 +1309,7 @@ def queue_translation(paper_id: str, force: bool = False) -> dict:
             raise HTTPException(404, "paper not found")
         row = db.execute("SELECT translation FROM analyses WHERE paper_id=?", (paper_id,)).fetchone()
         if row and row["translation"] and not force:
+            set_llm_job(paper_id, "translation", "cached")
             return {
                 "paper_id": paper_id,
                 "status": "cached",
@@ -1227,6 +1318,7 @@ def queue_translation(paper_id: str, force: bool = False) -> dict:
                 "translation": row["translation"],
             }
         if force:
+            set_llm_job(paper_id, "translation", "queued", force=True)
             db.execute("""
                 UPDATE analyses
                 SET translation='', translation_model='', translation_token_count=0, translation_created_at=NULL
@@ -1242,6 +1334,7 @@ def queue_translation(paper_id: str, force: bool = False) -> dict:
                 "cached": False,
                 "queued": True,
             }
+        set_llm_job(paper_id, "translation", "queued", force=force)
         future = TRANSLATION_EXECUTOR.submit(_run_translation_job, paper_id)
         TRANSLATION_JOBS[paper_id] = future
         return {"paper_id": paper_id, "status": "queued", "cached": False, "queued": True}
@@ -1301,33 +1394,34 @@ def queue_missing_translations(limit: int = 0) -> dict:
 
 
 def translation_queue_summary() -> dict:
-    with TRANSLATION_LOCK:
-        job_items = list(TRANSLATION_JOBS.items())
-    queued = running = done = failed = 0
-    for _, future in job_items:
-        if future.running():
-            running += 1
-        elif not future.done():
-            queued += 1
-        elif future.exception():
-            failed += 1
-        else:
-            done += 1
     with get_db() as db:
         total = db.execute("SELECT COUNT(*) as c FROM papers").fetchone()["c"]
         translated = db.execute("""
             SELECT COUNT(*) as c FROM analyses
             WHERE translation IS NOT NULL AND translation != ''
         """).fetchone()["c"]
+        counts = {
+            row["status"]: row["c"]
+            for row in db.execute("""
+                SELECT status, COUNT(*) as c
+                FROM llm_jobs
+                WHERE job_type='translation'
+                GROUP BY status
+            """).fetchall()
+        }
+        jobs_total = db.execute("""
+            SELECT COUNT(*) as c FROM llm_jobs WHERE job_type='translation'
+        """).fetchone()["c"]
     return {
         "total_papers": total,
         "translated": translated,
         "missing": max(total - translated, 0),
-        "jobs_total": len(job_items),
-        "queued": queued,
-        "running": running,
-        "done": done,
-        "failed": failed,
+        "jobs_total": jobs_total,
+        "queued": counts.get("queued", 0),
+        "running": counts.get("running", 0),
+        "done": counts.get("done", 0),
+        "failed": counts.get("failed", 0),
+        "recent_jobs": get_recent_llm_jobs("translation"),
         "auto_translate_on_start": AUTO_TRANSLATE_ON_START,
         "auto_translate_limit": AUTO_TRANSLATE_LIMIT,
         "model": DEFAULT_LLM_MODEL,
@@ -1336,33 +1430,34 @@ def translation_queue_summary() -> dict:
 
 
 def analysis_queue_summary() -> dict:
-    with ANALYSIS_LOCK:
-        job_items = list(ANALYSIS_JOBS.items())
-    queued = running = done = failed = 0
-    for _, future in job_items:
-        if future.running():
-            running += 1
-        elif not future.done():
-            queued += 1
-        elif future.exception():
-            failed += 1
-        else:
-            done += 1
     with get_db() as db:
         total = db.execute("SELECT COUNT(*) as c FROM papers").fetchone()["c"]
         analyzed = db.execute("""
             SELECT COUNT(*) as c FROM analyses
             WHERE analysis IS NOT NULL AND analysis != ''
         """).fetchone()["c"]
+        counts = {
+            row["status"]: row["c"]
+            for row in db.execute("""
+                SELECT status, COUNT(*) as c
+                FROM llm_jobs
+                WHERE job_type='analysis'
+                GROUP BY status
+            """).fetchall()
+        }
+        jobs_total = db.execute("""
+            SELECT COUNT(*) as c FROM llm_jobs WHERE job_type='analysis'
+        """).fetchone()["c"]
     return {
         "total_papers": total,
         "analyzed": analyzed,
         "missing": max(total - analyzed, 0),
-        "jobs_total": len(job_items),
-        "queued": queued,
-        "running": running,
-        "done": done,
-        "failed": failed,
+        "jobs_total": jobs_total,
+        "queued": counts.get("queued", 0),
+        "running": counts.get("running", 0),
+        "done": counts.get("done", 0),
+        "failed": counts.get("failed", 0),
+        "recent_jobs": get_recent_llm_jobs("analysis"),
         "model": DEFAULT_LLM_MODEL,
         "llm_configured": bool(DEFAULT_LLM_API_KEY),
     }
@@ -1617,6 +1712,11 @@ def get_analysis_status(paper_id: str):
             SELECT analysis, model, token_count, created_at
             FROM analyses WHERE paper_id=?
         """, (paper_id,)).fetchone()
+        job = db.execute("""
+            SELECT status, error, created_at, updated_at, started_at, finished_at
+            FROM llm_jobs
+            WHERE paper_id=? AND job_type='analysis'
+        """, (paper_id,)).fetchone()
     if row and row["analysis"]:
         return {
             "paper_id": paper_id,
@@ -1626,9 +1726,10 @@ def get_analysis_status(paper_id: str):
             "model": row["model"] or "",
             "token_count": row["token_count"] or 0,
             "created_at": row["created_at"],
+            "job": dict(job) if job else None,
         }
     status = _analysis_job_status(paper_id) or "missing"
-    return {"paper_id": paper_id, "status": status, "cached": False}
+    return {"paper_id": paper_id, "status": status, "cached": False, "job": dict(job) if job else None}
 
 
 @app.delete("/api/papers/{paper_id}/analyze")
@@ -1671,6 +1772,11 @@ def get_translation_status(paper_id: str):
             SELECT translation, translation_model, translation_token_count, translation_created_at
             FROM analyses WHERE paper_id=?
         """, (paper_id,)).fetchone()
+        job = db.execute("""
+            SELECT status, error, created_at, updated_at, started_at, finished_at
+            FROM llm_jobs
+            WHERE paper_id=? AND job_type='translation'
+        """, (paper_id,)).fetchone()
     if row and row["translation"]:
         return {
             "paper_id": paper_id,
@@ -1680,9 +1786,10 @@ def get_translation_status(paper_id: str):
             "translation_model": row["translation_model"] or "",
             "translation_token_count": row["translation_token_count"] or 0,
             "translation_created_at": row["translation_created_at"],
+            "job": dict(job) if job else None,
         }
     status = _translation_job_status(paper_id) or "missing"
-    return {"paper_id": paper_id, "status": status, "cached": False}
+    return {"paper_id": paper_id, "status": status, "cached": False, "job": dict(job) if job else None}
 
 
 @app.get("/api/papers/{paper_id}/translate/chunks")
@@ -1864,6 +1971,7 @@ def get_stats():
 def startup():
     init_db()
     log.info(f"Paper Reader API 已启动 | DB: {DB_PATH}")
+    mark_stale_llm_jobs_failed()
     start_auto_translation_worker()
 
 
