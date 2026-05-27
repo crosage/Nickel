@@ -22,6 +22,8 @@ import sqlite3
 import hashlib
 import logging
 import threading
+import shutil
+import subprocess
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone
@@ -58,6 +60,9 @@ AUTO_TRANSLATE_LIMIT = int(os.environ.get("AUTO_TRANSLATE_LIMIT", "0"))
 PDF_IMAGE_DPI = int(os.environ.get("PDF_IMAGE_DPI", "144"))
 FIGURE_IMAGE_DPI = int(os.environ.get("FIGURE_IMAGE_DPI", "180"))
 MAX_EXTRACTED_FIGURES = int(os.environ.get("MAX_EXTRACTED_FIGURES", "16"))
+PDFFIGURES2_CMD = os.environ.get("PDFFIGURES2_CMD", "").strip()
+PDFFIGURES2_JAR = os.environ.get("PDFFIGURES2_JAR", "").strip()
+INSERT_FIGURES_IN_TRANSLATION = os.environ.get("INSERT_FIGURES_IN_TRANSLATION", "0").lower() not in ("0", "false", "no")
 
 # Section 提取上限
 SECTION_MAX_CHARS = {
@@ -75,6 +80,9 @@ log = logging.getLogger(__name__)
 TRANSLATION_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paper_translation")
 TRANSLATION_JOBS: dict[str, Future] = {}
 TRANSLATION_LOCK = threading.Lock()
+ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paper_analysis")
+ANALYSIS_JOBS: dict[str, Future] = {}
+ANALYSIS_LOCK = threading.Lock()
 AUTO_TRANSLATE_STARTED = False
 
 # ─────────────────────────────────────────────
@@ -446,76 +454,134 @@ def render_pdf_page_images(paper_id: str, max_pages: int = 6) -> list[Path]:
 
 
 FIGURE_CAPTION_RE = re.compile(r"(?i)\b(?:fig(?:ure)?\.?)\s*([0-9]+)\b")
+INSERTED_FIGURE_MARKDOWN_RE = re.compile(r"\n{0,2}!\[Figure [^\]]+\]\(/api/papers/[^)]+/figures/[^)]+\)\n?", re.IGNORECASE)
 
 
-def extract_pdf_figures(paper_id: str, max_figures: int = MAX_EXTRACTED_FIGURES) -> list[dict]:
-    """Crop original figure regions near Fig./Figure captions for reinsertion in translations."""
+def _figure_cache_is_current(figures: list[dict]) -> bool:
+    return all(fig.get("source") in {"pdffigures2", "page_snapshot"} and fig.get("file") for fig in figures)
+
+
+def strip_inserted_figure_markdown(text: str) -> str:
+    if INSERT_FIGURES_IN_TRANSLATION:
+        return text
+    return re.sub(r"\n{3,}", "\n\n", INSERTED_FIGURE_MARKDOWN_RE.sub("\n\n", text)).strip()
+
+
+def _pdffigures2_command(pdf_path: Path, out_dir: Path, prefix: str) -> list[str]:
+    if PDFFIGURES2_CMD:
+        return [
+            *PDFFIGURES2_CMD.split(),
+            "-m", str(out_dir / f"{prefix}.json"),
+            "-d", str(out_dir),
+            "-f", prefix,
+            str(pdf_path),
+        ]
+    if PDFFIGURES2_JAR:
+        return [
+            "java", "-jar", PDFFIGURES2_JAR,
+            "-m", str(out_dir / f"{prefix}.json"),
+            "-d", str(out_dir),
+            "-f", prefix,
+            str(pdf_path),
+        ]
+    executable = shutil.which("pdffigures2") or shutil.which("pdffigures")
+    if executable:
+        return [
+            executable,
+            "-m", str(out_dir / f"{prefix}.json"),
+            "-d", str(out_dir),
+            "-f", prefix,
+            str(pdf_path),
+        ]
+    return []
+
+
+def _load_pdffigures2_figures(paper_id: str, pdf_path: Path, out_dir: Path, max_figures: int) -> list[dict]:
+    cmd = _pdffigures2_command(pdf_path, out_dir, paper_id)
+    if not cmd:
+        return []
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(cmd, check=True, timeout=180, capture_output=True, text=True)
+    except Exception as e:
+        log.warning(f"pdffigures2 extraction failed for {paper_id}: {e}")
+        return []
+
+    meta_path = out_dir / f"{paper_id}.json"
+    if not meta_path.exists():
+        return []
+
+    try:
+        raw_items = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning(f"pdffigures2 metadata unreadable for {paper_id}: {e}")
+        return []
+
+    figures = []
+    for idx, item in enumerate(raw_items, 1):
+        if str(item.get("figType", "Figure")).lower() == "table":
+            continue
+        render_url = item.get("renderURL") or item.get("imageText")
+        image_path = out_dir / render_url if render_url else None
+        if not image_path or not image_path.exists():
+            candidates = sorted(out_dir.glob(f"{paper_id}*Figure*{idx}*")) + sorted(out_dir.glob(f"{paper_id}*.png"))
+            image_path = candidates[0] if candidates else None
+        if not image_path or not image_path.exists():
+            continue
+
+        number = str(item.get("name") or idx)
+        match = re.search(r"\d+", number)
+        number = match.group(0) if match else str(idx)
+        caption = re.sub(r"\s+", " ", item.get("caption", "") or "")[:800]
+        figures.append({
+            "number": number,
+            "label": f"Figure {number}",
+            "caption": caption,
+            "page": int(item.get("page", 0) or 0) + 1,
+            "url": f"/api/papers/{paper_id}/figures/{number}",
+            "source": "pdffigures2",
+            "file": image_path.name,
+        })
+        if len(figures) >= max_figures:
+            break
+    return figures
+
+
+def _fallback_page_figures(paper_id: str, max_figures: int) -> list[dict]:
+    paths = render_pdf_page_images(paper_id, max_pages=min(max_figures, 8))
+    figures = []
+    for idx, path in enumerate(paths, 1):
+        figures.append({
+            "number": f"page-{idx}",
+            "label": f"Page {idx}",
+            "caption": "PDF page snapshot. Configure pdffigures2 for semantic figure extraction.",
+            "page": idx,
+            "url": f"/api/papers/{paper_id}/figures/page-{idx}",
+            "source": "page_snapshot",
+            "file": path.name,
+            "confidence": 0.2,
+        })
+    return figures
+
+
+def extract_pdf_figures(paper_id: str, max_figures: int = MAX_EXTRACTED_FIGURES, refresh: bool = False) -> list[dict]:
+    """Extract figures with external scholarly PDF tools, falling back to page snapshots."""
     out_dir = FIGURE_DIR / paper_id
     meta_path = out_dir / "figures.json"
-    if meta_path.exists():
+    if meta_path.exists() and not refresh:
         try:
-            return json.loads(meta_path.read_text(encoding="utf-8"))[:max_figures]
+            cached = json.loads(meta_path.read_text(encoding="utf-8"))
+            if _figure_cache_is_current(cached):
+                return cached[:max_figures]
         except Exception:
             pass
 
     pdf_path = ensure_pdf_downloaded(paper_id)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        import fitz
-    except Exception as e:
-        raise HTTPException(500, f"PyMuPDF is required for figure extraction: {e}")
-
-    figures = []
-    seen_numbers = set()
-    try:
-        doc = fitz.open(str(pdf_path))
-        zoom = FIGURE_IMAGE_DPI / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
-        for page_index in range(len(doc)):
-            if len(figures) >= max_figures:
-                break
-            page = doc.load_page(page_index)
-            blocks = page.get_text("blocks")
-            page_rect = page.rect
-            for block in blocks:
-                if len(figures) >= max_figures:
-                    break
-                text = (block[4] or "").strip()
-                match = FIGURE_CAPTION_RE.search(text)
-                if not match:
-                    continue
-                fig_no = match.group(1)
-                if fig_no in seen_numbers:
-                    continue
-                seen_numbers.add(fig_no)
-
-                caption_rect = fitz.Rect(block[:4])
-                clip = fitz.Rect(
-                    page_rect.x0,
-                    max(page_rect.y0, caption_rect.y0 - 360),
-                    page_rect.x1,
-                    min(page_rect.y1, caption_rect.y1 + 80),
-                )
-                if clip.height < 120:
-                    continue
-
-                image_path = out_dir / f"figure_{fig_no}.jpg"
-                pix = page.get_pixmap(matrix=matrix, clip=clip, alpha=False)
-                pix.save(str(image_path), output="jpeg", jpg_quality=88)
-                figures.append({
-                    "number": fig_no,
-                    "label": f"Figure {fig_no}",
-                    "caption": re.sub(r"\s+", " ", text)[:500],
-                    "page": page_index + 1,
-                    "url": f"/api/papers/{paper_id}/figures/{fig_no}",
-                })
-        doc.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"PDF figure extraction failed: {e}")
-        raise HTTPException(500, f"PDF figure extraction failed: {e}")
+    figures = _load_pdffigures2_figures(paper_id, pdf_path, out_dir, max_figures)
+    if not figures:
+        figures = _fallback_page_figures(paper_id, max_figures)
 
     meta_path.write_text(json.dumps(figures, ensure_ascii=False, indent=2), encoding="utf-8")
     return figures[:max_figures]
@@ -533,10 +599,9 @@ def build_figure_reference_map(paper_id: str, translation: str) -> list[dict]:
         no = str(fig.get("number", "")).strip()
         if not no:
             continue
-        pattern = re.compile(
-            rf"(?P<ref>(?:图|Figure|Fig\.?)\s*{re.escape(no)}(?:[^\n。；;]*[。；;]?)?)",
-            re.IGNORECASE,
-        )
+        if not no.isdigit():
+            continue
+        pattern = re.compile(rf"(?P<ref>(?:图|Figure|Fig\.?)\s*{re.escape(no)}\b(?:[^\n。；;]*[。；;]?)?)", re.IGNORECASE)
         match = pattern.search(translation)
         offset = match.start() if match else -1
         ref_text = match.group("ref")[:300] if match else ""
@@ -578,6 +643,9 @@ def build_figure_reference_map(paper_id: str, translation: str) -> list[dict]:
 
 def insert_figure_markdown_by_refs(translation: str, paper_id: str) -> str:
     """Insert figure markdown after the translated paragraph containing first semantic reference."""
+    if not INSERT_FIGURES_IN_TRANSLATION:
+        build_figure_reference_map(paper_id, translation)
+        return translation
     if not translation.strip():
         return translation
     if f"/api/papers/{paper_id}/figures/" in translation:
@@ -588,7 +656,7 @@ def insert_figure_markdown_by_refs(translation: str, paper_id: str) -> str:
     shift = 0
     for ref in refs:
         offset = int(ref.get("first_ref_offset", -1))
-        if offset < 0:
+        if offset < 0 or float(ref.get("confidence", 0.0)) < 0.8:
             continue
         url = ref.get("url", "")
         no = ref.get("figure_no", "")
@@ -972,13 +1040,91 @@ def analyze_paper(paper_id: str) -> str:
         return f"[LLM analysis failed: {e}]"
 
 
+def _analysis_job_status(paper_id: str) -> str:
+    with ANALYSIS_LOCK:
+        future = ANALYSIS_JOBS.get(paper_id)
+        if not future:
+            return ""
+        if future.running():
+            return "running"
+        if not future.done():
+            return "queued"
+        err = future.exception()
+        return "failed" if err else "done"
+
+
+def _run_analysis_job(paper_id: str) -> None:
+    log.info(f"Background analysis started: {paper_id}")
+    analysis = analyze_paper(paper_id)
+    if analysis.startswith("["):
+        raise RuntimeError(analysis)
+    log.info(f"Background analysis finished: {paper_id} | {len(analysis)} chars")
+
+
+def queue_analysis(paper_id: str, force: bool = False) -> dict:
+    if not DEFAULT_LLM_API_KEY:
+        raise HTTPException(400, "LLM_API_KEY is not configured")
+
+    with get_db() as db:
+        paper_exists = db.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone()
+        if not paper_exists:
+            raise HTTPException(404, "paper not found")
+        row = db.execute("SELECT analysis FROM analyses WHERE paper_id=?", (paper_id,)).fetchone()
+        if row and row["analysis"] and not force:
+            return {
+                "paper_id": paper_id,
+                "status": "cached",
+                "cached": True,
+                "analysis_length": len(row["analysis"]),
+                "analysis": row["analysis"],
+            }
+        if force:
+            db.execute("""
+                UPDATE analyses
+                SET analysis='', model='', token_count=0, created_at=datetime('now')
+                WHERE paper_id=?
+            """, (paper_id,))
+
+    with ANALYSIS_LOCK:
+        future = ANALYSIS_JOBS.get(paper_id)
+        if future and not future.done():
+            return {
+                "paper_id": paper_id,
+                "status": "running" if future.running() else "queued",
+                "cached": False,
+                "queued": True,
+            }
+        future = ANALYSIS_EXECUTOR.submit(_run_analysis_job, paper_id)
+        ANALYSIS_JOBS[paper_id] = future
+        return {"paper_id": paper_id, "status": "queued", "cached": False, "queued": True}
+
+
+def delete_analysis(paper_id: str) -> dict:
+    with ANALYSIS_LOCK:
+        future = ANALYSIS_JOBS.get(paper_id)
+        if future and not future.done():
+            future.cancel()
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
+            raise HTTPException(404, "paper not found")
+        db.execute("""
+            UPDATE analyses
+            SET analysis='', model='', token_count=0, created_at=datetime('now')
+            WHERE paper_id=?
+        """, (paper_id,))
+    return {"paper_id": paper_id, "deleted": True, "status": "missing"}
+
+
 
 def translate_paper(paper_id: str) -> str:
     """Call the LLM to generate a Chinese translation for the paper."""
     with get_db() as db:
         cached = db.execute("SELECT translation FROM analyses WHERE paper_id=?", (paper_id,)).fetchone()
         if cached and cached["translation"]:
-            translation = cached["translation"]
+            translation = strip_inserted_figure_markdown(cached["translation"])
+            if translation != cached["translation"]:
+                with get_db() as db:
+                    db.execute("UPDATE analyses SET translation=? WHERE paper_id=?", (translation, paper_id))
             if f"/api/papers/{paper_id}/figures/" not in translation:
                 enriched_translation = insert_figure_markdown_by_refs(translation, paper_id)
                 if enriched_translation != translation:
@@ -1189,6 +1335,39 @@ def translation_queue_summary() -> dict:
     }
 
 
+def analysis_queue_summary() -> dict:
+    with ANALYSIS_LOCK:
+        job_items = list(ANALYSIS_JOBS.items())
+    queued = running = done = failed = 0
+    for _, future in job_items:
+        if future.running():
+            running += 1
+        elif not future.done():
+            queued += 1
+        elif future.exception():
+            failed += 1
+        else:
+            done += 1
+    with get_db() as db:
+        total = db.execute("SELECT COUNT(*) as c FROM papers").fetchone()["c"]
+        analyzed = db.execute("""
+            SELECT COUNT(*) as c FROM analyses
+            WHERE analysis IS NOT NULL AND analysis != ''
+        """).fetchone()["c"]
+    return {
+        "total_papers": total,
+        "analyzed": analyzed,
+        "missing": max(total - analyzed, 0),
+        "jobs_total": len(job_items),
+        "queued": queued,
+        "running": running,
+        "done": done,
+        "failed": failed,
+        "model": DEFAULT_LLM_MODEL,
+        "llm_configured": bool(DEFAULT_LLM_API_KEY),
+    }
+
+
 def start_auto_translation_worker() -> None:
     global AUTO_TRANSLATE_STARTED
     if AUTO_TRANSLATE_STARTED or not AUTO_TRANSLATE_ON_START:
@@ -1362,6 +1541,11 @@ def get_paper(paper_id: str):
             pass
 
     translation = row["translation"] or ""
+    stripped_translation = strip_inserted_figure_markdown(translation)
+    if stripped_translation != translation:
+        translation = stripped_translation
+        with get_db() as db:
+            db.execute("UPDATE analyses SET translation=? WHERE paper_id=?", (translation, paper_id))
     if translation and f"/api/papers/{paper_id}/figures/" not in translation:
         enriched_translation = insert_figure_markdown_by_refs(translation, paper_id)
         if enriched_translation != translation:
@@ -1389,6 +1573,7 @@ def get_paper(paper_id: str):
         "translation_model": row["translation_model"] or "",
         "translation_token_count": row["translation_token_count"] or 0,
         "translation_created_at": row["translation_created_at"],
+        "analysis_job_status": _analysis_job_status(paper_id),
         "translation_job_status": _translation_job_status(paper_id),
         "notes": [{"id": n["id"], "content": n["content"],
                     "created_at": n["created_at"], "updated_at": n["updated_at"]}
@@ -1399,16 +1584,57 @@ def get_paper(paper_id: str):
 # ── 解读 ──
 
 @app.post("/api/papers/{paper_id}/analyze")
-def trigger_analysis(paper_id: str):
-    """触发 LLM 解读（异步友好：先提取 section，再调 LLM）。"""
+def trigger_analysis(paper_id: str, force: bool = False, background: bool = True):
+    """Trigger LLM analysis. Background mode is the default for stable UI state."""
+    if background:
+        return queue_analysis(paper_id, force=force)
+
     with get_db() as db:
         if not db.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
             raise HTTPException(404, "论文不存在")
+        if not force:
+            row = db.execute("SELECT analysis FROM analyses WHERE paper_id=?", (paper_id,)).fetchone()
+            if row and row["analysis"]:
+                return {"paper_id": paper_id, "analysis_length": len(row["analysis"]), "analysis": row["analysis"], "cached": True}
+        else:
+            db.execute("""
+                UPDATE analyses
+                SET analysis='', model='', token_count=0, created_at=datetime('now')
+                WHERE paper_id=?
+            """, (paper_id,))
 
     sections = download_and_extract(paper_id)
     analysis = analyze_paper(paper_id)
     return {"paper_id": paper_id, "sections": list(sections.keys()),
             "analysis_length": len(analysis), "analysis": analysis}
+
+
+@app.get("/api/papers/{paper_id}/analyze/status")
+def get_analysis_status(paper_id: str):
+    """Get cached/background analysis state."""
+    with get_db() as db:
+        row = db.execute("""
+            SELECT analysis, model, token_count, created_at
+            FROM analyses WHERE paper_id=?
+        """, (paper_id,)).fetchone()
+    if row and row["analysis"]:
+        return {
+            "paper_id": paper_id,
+            "status": "cached",
+            "cached": True,
+            "analysis_length": len(row["analysis"]),
+            "model": row["model"] or "",
+            "token_count": row["token_count"] or 0,
+            "created_at": row["created_at"],
+        }
+    status = _analysis_job_status(paper_id) or "missing"
+    return {"paper_id": paper_id, "status": status, "cached": False}
+
+
+@app.delete("/api/papers/{paper_id}/analyze")
+def delete_paper_analysis(paper_id: str):
+    """Delete cached analysis so it can be regenerated."""
+    return delete_analysis(paper_id)
 
 
 @app.post("/api/papers/{paper_id}/translate")
@@ -1482,6 +1708,12 @@ def get_translation_queue_status():
     return translation_queue_summary()
 
 
+@app.get("/api/analyses/status")
+def get_analysis_queue_status():
+    """Get global analysis queue/cache progress."""
+    return analysis_queue_summary()
+
+
 @app.post("/api/translations/prefetch")
 def prefetch_translations(limit: int = 0):
     """Queue missing translations without waiting for LLM completion."""
@@ -1526,7 +1758,7 @@ def get_page_image_file(paper_id: str, page_no: int):
 
 @app.get("/api/papers/{paper_id}/figures")
 def get_figures(paper_id: str, limit: int = MAX_EXTRACTED_FIGURES):
-    """Extract original figure crops near Fig./Figure captions."""
+    """Extract figures with pdffigures2 when configured, otherwise return page snapshots."""
     limit = max(1, min(limit, 40))
     figures = extract_pdf_figures(paper_id, max_figures=limit)
     with get_db() as db:
@@ -1553,7 +1785,10 @@ def get_figure_file(paper_id: str, figure_no: str):
     figures = extract_pdf_figures(paper_id)
     for fig in figures:
         if str(fig.get("number")) == str(figure_no):
-            path = FIGURE_DIR / paper_id / f"figure_{figure_no}.jpg"
+            if fig.get("source") == "page_snapshot":
+                path = PAGE_IMAGE_DIR / paper_id / str(fig.get("file", ""))
+            else:
+                path = FIGURE_DIR / paper_id / str(fig.get("file") or f"figure_{figure_no}.jpg")
             if path.exists():
                 return FileResponse(path, media_type="image/jpeg")
     raise HTTPException(404, "figure not found")
